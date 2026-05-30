@@ -20,7 +20,7 @@ import java.util.Optional
 import xsbti.VirtualFile
 
 class IncrementalCompilerSpec extends BaseCompilerSpec {
-  // override val logLevel = sbt.util.Level.Debug
+  override val logLevel = sbt.util.Level.Debug
   behavior.of("incremental compiler")
 
   it should "compile" in withTmpDir { tmp =>
@@ -261,4 +261,76 @@ class IncrementalCompilerSpec extends BaseCompilerSpec {
         }
       } finally comp.close()
   }
+
+  it should "recover from cycle failure when an intermediate class has stale class files" in
+    withTmpDir { tmp =>
+      // p1.Wrapper changes [T, C] → [T]. In p2, A directly uses Wrapper, B uses A.w
+      // (Wrapper type via inference), C uses B.getW. Only A's source is updated.
+      // C's class file is deleted to simulate "removed products" from build state restore.
+      //
+      // Bug: only A (source) and C (product) are initially invalidated. Cycle 1 compiles
+      // A+C, but C fails because B.class still references Wrapper[Int, String].
+      // Fix: on cycle failure, expand invalidation to direct dependents (B) and retry.
+      //
+      // The custom ExternalLookup suppresses library-stamp detection so B isn't caught
+      // via Wrapper's changed binary stamp — simulating real cases where name hashing
+      // misses transitive deps through complex type indirection.
+
+      val p1 = VirtualSubproject(tmp.toPath / "p1")
+      val p2 = VirtualSubproject(tmp.toPath / "p2").dependsOn(p1)
+      val c1 = p1.setup.createCompiler()
+
+      val ext = new NoopExternalLookup {
+        override def changedBinaries(
+            prev: CompileAnalysis
+        ): Option[Set[xsbti.VirtualFileRef]] = Some(Set.empty)
+      }
+      val extHooks = new DefaultExternalHooks(Optional.of(ext), Optional.empty())
+      val c2Base = p2.setup.createCompiler()
+      val c2 = c2Base.copy(
+        incOptions = c2Base.incOptions
+          .withExternalHooks(extHooks)
+          .withRecompileAllFraction(1.0) // disable fallback to full recompile
+      )
+      try {
+        val wrapperV1 = StringVirtualFile(
+          "Wrapper.scala",
+          "package up\nclass Wrapper[T, C](val x: T)\n"
+        )
+        val aV1 = StringVirtualFile(
+          "A.scala",
+          "package down\nimport up.Wrapper\nclass A { val w = new Wrapper[Int, String](1) }\n"
+        )
+        val b = StringVirtualFile(
+          "B.scala",
+          "package down\nclass B { val a = new A; def getW = a.w }\n"
+        )
+        val cSrc = StringVirtualFile(
+          "C.scala",
+          "package down\nclass C { val w = (new B).getW }\n"
+        )
+
+        c1.compile(wrapperV1)
+        val result1 = c2.compile(aV1, b, cSrc)
+
+        val wrapperV2 = StringVirtualFile(
+          "Wrapper.scala",
+          "package up\nclass Wrapper[T](val x: T)\n"
+        )
+        val aV2 = StringVirtualFile(
+          "A.scala",
+          "package down\nimport up.Wrapper\nclass A { val w = new Wrapper[Int](1) }\n"
+        )
+
+        c1.compile(wrapperV2)
+        java.nio.file.Files.deleteIfExists(p2.classesDir.resolve("down/C.class"))
+        val result2 = c2.compile(aV2, b, cSrc)
+
+        val recompiledSet = recompiled(result1, result2)
+        assert(recompiledSet == Set("down.A", "down.B", "down.C"), recompiledSet)
+      } finally {
+        c1.close()
+        c2.close()
+      }
+    }
 }

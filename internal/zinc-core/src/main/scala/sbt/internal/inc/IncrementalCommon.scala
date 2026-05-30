@@ -259,9 +259,33 @@ private[inc] abstract class IncrementalCommon(
       output,
       cycleNum,
     )
-    val it = iterations(s)
-    while (it.hasNext) {
-      s = it.next()
+    var expandedRetries = Set.empty[String]
+    while (s.hasNext) {
+      try {
+        s = s.next
+      } catch {
+        case e: xsbti.CompileFailed =>
+          // Recover from cycle failure caused by a stale class file of an intermediate
+          // class that wasn't initially invalidated. Expand the invalidation set to
+          // include direct dependents of the classes being compiled, then retry.
+          val packageObj =
+            invalidatedPackageObjects(s.invalidatedClasses, s.previous.relations, s.previous.apis)
+          val classesInCycle =
+            s.invalidatedClasses ++ packageObj ++
+              s.initialChangedSources.flatMap(s.previous.relations.classNames)
+          val dependents = classesInCycle.flatMap(s.previous.relations.usesInternalClass)
+          val newDeps = dependents -- classesInCycle -- expandedRetries
+          if (newDeps.isEmpty) throw e
+          log.warn(
+            s"Cycle ${s.cycleNum} failed; expanding invalidation by ${newDeps.size} dependent class(es) and retrying: ${newDeps.mkString(", ")}"
+          )
+          expandedRetries ++= newDeps
+          s = s.copy(invalidatedClasses = s.invalidatedClasses ++ newDeps)
+          // Clear the user-visible reporter so the retry starts with a clean slate.
+          // Without this, the cached scalac compiler short-circuits because the delegate
+          // reporter still reports `hasErrors = true` from the failed cycle.
+          s.doCompile.reset()
+      }
     }
     s.previous
   }
