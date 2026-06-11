@@ -100,13 +100,6 @@ object Incremental {
         changes: DependencyChanges,
         incHandler: IncrementalCallback
     ): CompileCycleResult
-
-    /**
-     * Reset compiler state (notably the user-visible reporter) so a fresh cycle can run.
-     * Used by the recovery path in [[IncrementalCommon.cycle]] when a cycle fails and
-     * we expand the invalidation set to retry.
-     */
-    def reset(): Unit
   }
   case class CompileCycleResult(
       continue: Boolean,
@@ -151,8 +144,7 @@ object Incremental {
       earlyOutput: Option[Output],
       earlyAnalysisStore: Option[XAnalysisStore],
       progress: Option[CompileProgress],
-      log: Logger,
-      onCycleReset: () => Unit = () => ()
+      log: Logger
   )(
       compile: (
           Set[VirtualFile],
@@ -212,8 +204,7 @@ object Incremental {
         outputJarContent,
         earlyOutput,
         progress,
-        log,
-        onCycleReset
+        log
       )(Equiv.universal)
     } catch {
       case _: xsbti.CompileCancelled =>
@@ -341,8 +332,7 @@ object Incremental {
       outputJarContent: JarUtils.OutputJarContent,
       earlyOutput: Option[Output],
       progress: Option[CompileProgress],
-      log: sbt.util.Logger,
-      onCycleReset: () => Unit = () => ()
+      log: sbt.util.Logger
   )(implicit equivS: Equiv[XStamp]): (Boolean, Analysis) = {
     log.debug("IncrementalCompile.incrementalCompile")
     val previous = previous0 match { case a: Analysis => a }
@@ -417,7 +407,7 @@ object Incremental {
             binaryChanges,
             lookup,
             previous,
-            doCompile(compile, callbackBuilder, classfileManager, onCycleReset),
+            doCompile(compile, callbackBuilder, classfileManager),
             classfileManager,
             output,
             1,
@@ -454,8 +444,7 @@ object Incremental {
           XClassFileManager
       ) => Unit,
       callbackBuilder: AnalysisCallback.Builder,
-      classFileManager: XClassFileManager,
-      onReset: () => Unit = () => ()
+      classFileManager: XClassFileManager
   ): CompileCycle = new CompileCycle {
     override def run(
         srcs: Set[VirtualFile],
@@ -469,7 +458,6 @@ object Incremental {
       compile(srcs, changes, callback, classFileManager)
       callback.getCycleResultOnce
     }
-    override def reset(): Unit = onReset()
   }
 
   // the name of system property that was meant to enable debugging mode of incremental compiler but

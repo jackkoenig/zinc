@@ -259,33 +259,9 @@ private[inc] abstract class IncrementalCommon(
       output,
       cycleNum,
     )
-    var expandedRetries = Set.empty[String]
-    while (s.hasNext) {
-      try {
-        s = s.next
-      } catch {
-        case e: xsbti.CompileFailed =>
-          // Recover from cycle failure caused by a stale class file of an intermediate
-          // class that wasn't initially invalidated. Expand the invalidation set to
-          // include direct dependents of the classes being compiled, then retry.
-          val packageObj =
-            invalidatedPackageObjects(s.invalidatedClasses, s.previous.relations, s.previous.apis)
-          val classesInCycle =
-            s.invalidatedClasses ++ packageObj ++
-              s.initialChangedSources.flatMap(s.previous.relations.classNames)
-          val dependents = classesInCycle.flatMap(s.previous.relations.usesInternalClass)
-          val newDeps = dependents -- classesInCycle -- expandedRetries
-          if (newDeps.isEmpty) throw e
-          log.warn(
-            s"Cycle ${s.cycleNum} failed; expanding invalidation by ${newDeps.size} dependent class(es) and retrying: ${newDeps.mkString(", ")}"
-          )
-          expandedRetries ++= newDeps
-          s = s.copy(invalidatedClasses = s.invalidatedClasses ++ newDeps)
-          // Clear the user-visible reporter so the retry starts with a clean slate.
-          // Without this, the cached scalac compiler short-circuits because the delegate
-          // reporter still reports `hasErrors = true` from the failed cycle.
-          s.doCompile.reset()
-      }
+    val it = iterations(s)
+    while (it.hasNext) {
+      s = it.next()
     }
     s.previous
   }
@@ -569,7 +545,32 @@ private[inc] abstract class IncrementalCommon(
       }.toSet
     }
 
-    val allInvalidatedClasses = invalidatedClasses ++ byExtSrcDep
+    // Classes invalidated by removed products must be recompiled in the first cycle,
+    // before the incremental algorithm has had a chance to propagate invalidation from
+    // the changed classes to their dependents. A class on an internal dependency path
+    // between a removed product and the other invalidated classes may therefore still
+    // have a class file that is stale with respect to this run (e.g. one referring to
+    // the old API of a changed class), which would break the first compilation cycle.
+    // Preemptively invalidate such intermediate classes so that they are recompiled
+    // from source in the first cycle as well.
+    val staleIntermediates: Set[String] =
+      if (byProduct.isEmpty) Set.empty
+      else {
+        val removedProductClasses = classNames(byProduct)
+        val dependenciesOfRemovedProducts =
+          IncrementalCommon.transitiveDeps(removedProductClasses, log, logging = false)(
+            previous.internalClassDeps
+          )
+        val changed =
+          (invalidatedClasses ++ byExtSrcDep ++ classNames(byLibraryDep)) &
+            dependenciesOfRemovedProducts
+        val intermediates = IncrementalCommon.transitiveDeps(changed, log, logging = false)(c =>
+          previous.usesInternalClass(c) & dependenciesOfRemovedProducts
+        )
+        intermediates -- changed -- removedProductClasses
+      }
+
+    val allInvalidatedClasses = invalidatedClasses ++ byExtSrcDep ++ staleIntermediates
     val allInvalidatedSourcefiles = addedSrcs ++ modifiedSrcs ++ byProduct ++ byLibraryDep
 
     if (previous.allSources.isEmpty)
@@ -589,7 +590,8 @@ private[inc] abstract class IncrementalCommon(
         |Sources indirectly invalidated by:
         |	product: $byProduct
         |	binary dep: $byLibraryDep
-        |	external source: $byExtSrcDep""".stripMargin)
+        |	external source: $byExtSrcDep
+        |Intermediate classes invalidated by removed products: $staleIntermediates""".stripMargin)
 
     (allInvalidatedClasses, allInvalidatedSourcefiles)
   }

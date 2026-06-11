@@ -538,8 +538,7 @@ class IncrementalCompilerImpl extends IncrementalCompiler {
       earlyOutput,
       earlyAnalysisStore,
       progress,
-      log,
-      () => mixedCompiler.config.reporter.reset()
+      log
     )(mixedCompiler.compile)
   }
 
