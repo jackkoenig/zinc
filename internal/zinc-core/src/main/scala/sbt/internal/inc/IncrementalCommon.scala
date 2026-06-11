@@ -545,30 +545,44 @@ private[inc] abstract class IncrementalCommon(
       }.toSet
     }
 
-    // Classes invalidated by removed products must be recompiled in the first cycle,
-    // before the incremental algorithm has had a chance to propagate invalidation from
-    // the changed classes to their dependents. A class on an internal dependency path
-    // between a removed product and the other invalidated classes may therefore still
-    // have a class file that is stale with respect to this run (e.g. one referring to
-    // the old API of a changed class), which would break the first compilation cycle.
-    // Preemptively invalidate such intermediate classes so that they are recompiled
-    // from source in the first cycle as well.
-    val staleIntermediates: Set[String] =
-      if (byProduct.isEmpty) Set.empty
-      else {
-        val removedProductClasses = classNames(byProduct)
-        val dependenciesOfRemovedProducts =
-          IncrementalCommon.transitiveDeps(removedProductClasses, log, logging = false)(
-            previous.internalClassDeps
-          )
-        val changed =
-          (invalidatedClasses ++ byExtSrcDep ++ classNames(byLibraryDep)) &
-            dependenciesOfRemovedProducts
-        val intermediates = IncrementalCommon.transitiveDeps(changed, log, logging = false)(c =>
-          previous.usesInternalClass(c) & dependenciesOfRemovedProducts
-        )
-        intermediates -- changed -- removedProductClasses
-      }
+    // Normally invalidation propagates outward cycle by cycle, so a class is only ever
+    // compiled after the dependencies it is affected by have been recompiled in an
+    // earlier cycle. Some classes, however, are forced into the *first* cycle without
+    // having changed themselves: classes whose products were removed externally, and
+    // classes that merely share a source file with a changed class. Such a "reader" may
+    // be compiled against the stale class file of an intermediate class — one on an
+    // internal dependency path between the reader and a changed class — which can break
+    // the first cycle (e.g. scalac crashes or errors reading a class file that still
+    // refers to the old API of the changed class). Preemptively invalidate those
+    // intermediate classes so that they are recompiled from source in the first cycle
+    // as well.
+    //
+    // Self-paths are deliberately excluded: an intermediate is only at risk between two
+    // *distinct* first-cycle classes. Including paths from a changed class back to
+    // itself (dependency cycles) would recompile the whole cycle on every edit, even
+    // for pure implementation changes.
+    val staleIntermediates: Set[String] = {
+      def intermediatesBetween(readers: Set[String], changed: Set[String]): Set[String] =
+        if (readers.isEmpty || changed.isEmpty) Set.empty
+        else {
+          val readBy =
+            IncrementalCommon.reachableFromRoots(readers, previous.internalClassDeps)
+          val affectedBy =
+            IncrementalCommon.reachableFromRoots(changed, previous.usesInternalClass)
+          val candidates = readBy.keySet & affectedBy.keySet
+          // a candidate qualifies if some reader and some changed class connected
+          // through it are distinct, i.e. its labels contain two distinct classes
+          candidates.iterator.filter(c => (readBy(c) ++ affectedBy(c)).size >= 2).toSet
+        }
+
+      val changedRoots = invalidatedClasses ++ byExtSrcDep ++ classNames(byLibraryDep)
+      val byRemovedProducts = intermediatesBetween(classNames(byProduct), changedRoots)
+      val bySharedSource = modifiedSrcs.iterator.flatMap { src =>
+        val housemates = previous.classNames(src)
+        if (housemates.size >= 2) intermediatesBetween(housemates, housemates) else Nil
+      }.toSet
+      (byRemovedProducts ++ bySharedSource) -- changedRoots -- classNames(byProduct)
+    }
 
     val allInvalidatedClasses = invalidatedClasses ++ byExtSrcDep ++ staleIntermediates
     val allInvalidatedSourcefiles = addedSrcs ++ modifiedSrcs ++ byProduct ++ byLibraryDep
@@ -591,7 +605,7 @@ private[inc] abstract class IncrementalCommon(
         |	product: $byProduct
         |	binary dep: $byLibraryDep
         |	external source: $byExtSrcDep
-        |Intermediate classes invalidated by removed products: $staleIntermediates""".stripMargin)
+        |Stale intermediate classes: $staleIntermediates""".stripMargin)
 
     (allInvalidatedClasses, allInvalidatedSourcefiles)
   }
@@ -858,6 +872,36 @@ object IncrementalCommon {
       all(start, dependencies(start))
     }
     visited.toSet
+  }
+
+  /**
+   * Computes, for every node reachable from `roots` by following `next` edges
+   * (including the roots themselves), up to two distinct roots from which it can be
+   * reached. Capping the label sets at two keeps the traversal linear in the number of
+   * edges while still letting callers decide whether a node lies on a path between two
+   * *distinct* roots: label sets of size one are exact, and any two distinct labels are
+   * as good as all of them.
+   */
+  private[inc] def reachableFromRoots(
+      roots: Set[String],
+      next: String => Set[String]
+  ): collection.Map[String, Set[String]] = {
+    val reached = collection.mutable.Map.empty[String, Set[String]]
+    val queue = collection.mutable.Queue.empty[String]
+    def add(node: String, labels: Set[String]): Unit = {
+      val current = reached.getOrElse(node, Set.empty)
+      if (current.size < 2 && !labels.subsetOf(current)) {
+        reached(node) = (current ++ labels).take(2)
+        queue += node
+      }
+    }
+    roots.foreach(root => add(root, Set(root)))
+    while (queue.nonEmpty) {
+      val node = queue.dequeue()
+      val labels = reached(node)
+      next(node).foreach(add(_, labels))
+    }
+    reached
   }
 
   /**
